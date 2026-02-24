@@ -60,3 +60,71 @@ func TestPluginExists(t *testing.T) {
 	// Whether it returns true or false depends on the build environment.
 	_ = PluginExists()
 }
+
+func TestTxStatusString(t *testing.T) {
+	tests := []struct {
+		s    TxStatus
+		want string
+	}{
+		{TxOK, "ok"},
+		{TxReturn, "return"},
+		{TxRevert, "revert"},
+		{TxOOG, "oog"},
+		{TxError, "error"},
+		{TxCallNotSupported, "call-not-supported"},
+		{TxStatus(99), "status(99)"},
+	}
+	for _, tt := range tests {
+		if got := tt.s.String(); got != tt.want {
+			t.Errorf("TxStatus(%d).String() = %q, want %q", int(tt.s), got, tt.want)
+		}
+	}
+}
+
+func TestExecuteBlockV2Empty(t *testing.T) {
+	result, err := ExecuteBlockV2(CPUSequential, 0, nil)
+	if err != nil {
+		t.Fatalf("ExecuteBlockV2(nil) returned error: %v", err)
+	}
+	if result.ABIVersion != ABIVersion {
+		t.Errorf("ABIVersion = %d, want %d", result.ABIVersion, ABIVersion)
+	}
+	if result.TotalGas != 0 {
+		t.Errorf("expected 0 total gas for empty block, got %d", result.TotalGas)
+	}
+}
+
+func TestAvailableBackends(t *testing.T) {
+	bs := AvailableBackends()
+	if len(bs) == 0 {
+		t.Fatal("AvailableBackends() returned empty list")
+	}
+	// CPUSequential must always be available.
+	hasSeq := false
+	for _, b := range bs {
+		if b == CPUSequential {
+			hasSeq = true
+		}
+	}
+	if !hasSeq {
+		t.Errorf("AvailableBackends() missing CPUSequential: %v", bs)
+	}
+}
+
+func TestBackendName(t *testing.T) {
+	// BackendName goes through the loaded library (cgo path) or local
+	// Go strings (nocgo path). Either way, it must produce a non-empty
+	// string for known backends.
+	for _, b := range []Backend{CPUSequential, CPUParallel, GPUMetal, GPUCUDA} {
+		if BackendName(b) == "" {
+			t.Errorf("BackendName(%d) is empty", int(b))
+		}
+	}
+}
+
+func TestLibraryABIVersion(t *testing.T) {
+	got := LibraryABIVersion()
+	if got != ABIVersion {
+		t.Errorf("LibraryABIVersion() = %d, want %d (rebuild libevm-gpu)", got, ABIVersion)
+	}
+}

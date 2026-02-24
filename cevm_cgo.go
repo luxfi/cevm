@@ -83,3 +83,104 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 
 	return br, nil
 }
+
+// ExecuteBlockV2 runs a block through the C++ EVM and returns the V2 result
+// with per-tx status and post-execution state root.
+func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*BlockResultV2, error) {
+	if got := uint32(C.gpu_abi_version()); got != ABIVersion {
+		return nil, fmt.Errorf("cevm: ABI version mismatch (lib=%d expected=%d)", got, ABIVersion)
+	}
+	if len(txs) == 0 {
+		return &BlockResultV2{ABIVersion: ABIVersion}, nil
+	}
+
+	ctxs := make([]C.CGpuTx, len(txs))
+	pins := make([][]byte, len(txs))
+
+	for i, tx := range txs {
+		ctxs[i].from = *(*[20]C.uint8_t)(unsafe.Pointer(&tx.From[0]))
+		ctxs[i].to = *(*[20]C.uint8_t)(unsafe.Pointer(&tx.To[0]))
+		ctxs[i].gas_limit = C.uint64_t(tx.GasLimit)
+		ctxs[i].value = C.uint64_t(tx.Value)
+		ctxs[i].nonce = C.uint64_t(tx.Nonce)
+		ctxs[i].gas_price = C.uint64_t(tx.GasPrice)
+		if tx.HasTo {
+			ctxs[i].has_to = 1
+		}
+		if len(tx.Data) > 0 {
+			pins[i] = tx.Data
+			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&pins[i][0]))
+			ctxs[i].data_len = C.uint32_t(len(tx.Data))
+		}
+	}
+
+	result := C.gpu_execute_block_v2(
+		&ctxs[0],
+		C.uint32_t(len(ctxs)),
+		C.uint8_t(backend),
+		C.uint32_t(numThreads),
+	)
+
+	if result.ok == 0 {
+		C.gpu_free_result_v2(&result)
+		return nil, fmt.Errorf("cevm: execute_block_v2 failed")
+	}
+
+	br := &BlockResultV2{
+		TotalGas:     uint64(result.total_gas),
+		ExecTimeMs:   float64(result.exec_time_ms),
+		Conflicts:    uint32(result.conflicts),
+		ReExecutions: uint32(result.re_executions),
+		ABIVersion:   uint32(result.abi_version),
+	}
+	for i := 0; i < 32; i++ {
+		br.StateRoot[i] = byte(result.state_root[i])
+	}
+	if result.gas_used != nil && result.num_txs > 0 {
+		gasSlice := unsafe.Slice((*uint64)(unsafe.Pointer(result.gas_used)), int(result.num_txs))
+		br.GasUsed = make([]uint64, len(gasSlice))
+		copy(br.GasUsed, gasSlice)
+	}
+	if result.status != nil && result.num_txs > 0 {
+		statSlice := unsafe.Slice((*uint8)(unsafe.Pointer(result.status)), int(result.num_txs))
+		br.Status = make([]TxStatus, len(statSlice))
+		for i, s := range statSlice {
+			br.Status[i] = TxStatus(s)
+		}
+	}
+
+	C.gpu_free_result_v2(&result)
+	return br, nil
+}
+
+// BackendName returns the human-readable name of a backend as reported by the
+// C++ library (which is authoritative).
+func BackendName(b Backend) string {
+	cstr := C.gpu_backend_name(C.uint8_t(b))
+	if cstr == nil {
+		return "unknown"
+	}
+	return C.GoString(cstr)
+}
+
+// AvailableBackends returns the list of backends compiled and detected
+// at runtime by the loaded library.
+func AvailableBackends() []Backend {
+	n := uint32(C.gpu_available_backends(nil, 0))
+	if n == 0 {
+		return nil
+	}
+	buf := make([]C.uint8_t, n)
+	got := uint32(C.gpu_available_backends(&buf[0], C.uint32_t(n)))
+	out := make([]Backend, got)
+	for i := uint32(0); i < got; i++ {
+		out[i] = Backend(buf[i])
+	}
+	return out
+}
+
+// LibraryABIVersion returns the ABI version reported by the loaded library.
+// Useful for diagnostics when binaries and shared libs may drift.
+func LibraryABIVersion() uint32 {
+	return uint32(C.gpu_abi_version())
+}

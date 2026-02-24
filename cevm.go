@@ -70,3 +70,52 @@ type BlockResult struct {
 	// ReExecutions caused by conflicts.
 	ReExecutions uint32
 }
+
+// TxStatus is a per-transaction execution outcome from the V2 ABI.
+type TxStatus uint8
+
+const (
+	TxOK              TxStatus = 0 // STOP / clean exit
+	TxReturn          TxStatus = 1
+	TxRevert          TxStatus = 2
+	TxOOG             TxStatus = 3
+	TxError           TxStatus = 4
+	TxCallNotSupported TxStatus = 5
+)
+
+// String returns a short label for the tx status.
+func (s TxStatus) String() string {
+	switch s {
+	case TxOK:
+		return "ok"
+	case TxReturn:
+		return "return"
+	case TxRevert:
+		return "revert"
+	case TxOOG:
+		return "oog"
+	case TxError:
+		return "error"
+	case TxCallNotSupported:
+		return "call-not-supported"
+	default:
+		return fmt.Sprintf("status(%d)", int(s))
+	}
+}
+
+// BlockResultV2 extends BlockResult with the V2 ABI fields: per-tx status
+// and the post-execution state root.
+type BlockResultV2 struct {
+	StateRoot [32]byte
+	GasUsed   []uint64
+	Status    []TxStatus
+	TotalGas  uint64
+	ExecTimeMs   float64
+	Conflicts    uint32
+	ReExecutions uint32
+	ABIVersion   uint32
+}
+
+// ABIVersion is the C ABI version this Go module expects. Compare against
+// the loaded library's gpu_abi_version() to detect version skew.
+const ABIVersion uint32 = 2
