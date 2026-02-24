@@ -21,6 +21,7 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"unsafe"
 )
 
@@ -36,8 +37,11 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 	}
 
 	ctxs := make([]C.CGpuTx, len(txs))
-	// Pin data slices so GC does not move them during the C call.
-	pins := make([][]byte, len(txs))
+	// Pin every Go-owned slice that ends up being addressed from inside ctxs.
+	// cgo forbids "Go pointer to unpinned Go pointer" — the ctxs array itself
+	// is passed to C, and each entry's `data` field is a Go pointer.
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
 
 	for i, tx := range txs {
 		ctxs[i].from = *(*[20]C.uint8_t)(unsafe.Pointer(&tx.From[0]))
@@ -52,8 +56,8 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 		}
 
 		if len(tx.Data) > 0 {
-			pins[i] = tx.Data
-			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&pins[i][0]))
+			pinner.Pin(&txs[i].Data[0])
+			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&txs[i].Data[0]))
 			ctxs[i].data_len = C.uint32_t(len(tx.Data))
 		}
 	}
@@ -97,7 +101,8 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 	}
 
 	ctxs := make([]C.CGpuTx, len(txs))
-	pins := make([][]byte, len(txs))
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
 
 	for i, tx := range txs {
 		ctxs[i].from = *(*[20]C.uint8_t)(unsafe.Pointer(&tx.From[0]))
@@ -110,8 +115,8 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 			ctxs[i].has_to = 1
 		}
 		if len(tx.Data) > 0 {
-			pins[i] = tx.Data
-			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&pins[i][0]))
+			pinner.Pin(&txs[i].Data[0])
+			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&txs[i].Data[0]))
 			ctxs[i].data_len = C.uint32_t(len(tx.Data))
 		}
 	}
