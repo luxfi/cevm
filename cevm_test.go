@@ -128,3 +128,66 @@ func TestLibraryABIVersion(t *testing.T) {
 		t.Errorf("LibraryABIVersion() = %d, want %d (rebuild libevm-gpu)", got, ABIVersion)
 	}
 }
+
+func smokeTx(i uint64) Transaction {
+	var from [20]byte
+	from[19] = byte(i + 1) // distinct sender per tx
+	return Transaction{
+		From:     from,
+		HasTo:    true,
+		GasLimit: 21000,
+		Value:    1,
+		Nonce:    i,
+		GasPrice: 1,
+	}
+}
+
+func TestExecuteBlockSmoke_AllBackends(t *testing.T) {
+	// Send a tiny block through every backend the loaded library exposes.
+	// Each backend must produce a result with TotalGas > 0 and num_txs entries.
+	const N = 4
+	txs := make([]Transaction, N)
+	for i := range txs {
+		txs[i] = smokeTx(uint64(i))
+	}
+
+	for _, b := range AvailableBackends() {
+		t.Run(BackendName(b), func(t *testing.T) {
+			r, err := ExecuteBlock(b, txs)
+			if err != nil {
+				t.Fatalf("ExecuteBlock(%s): %v", BackendName(b), err)
+			}
+			if r.TotalGas == 0 {
+				t.Errorf("expected non-zero total gas, got 0")
+			}
+			if len(r.GasUsed) != N {
+				t.Errorf("len(GasUsed) = %d, want %d", len(r.GasUsed), N)
+			}
+		})
+	}
+}
+
+func TestExecuteBlockV2Smoke_AllBackends(t *testing.T) {
+	const N = 4
+	txs := make([]Transaction, N)
+	for i := range txs {
+		txs[i] = smokeTx(uint64(i))
+	}
+	for _, b := range AvailableBackends() {
+		t.Run(BackendName(b), func(t *testing.T) {
+			r, err := ExecuteBlockV2(b, 0, txs)
+			if err != nil {
+				t.Fatalf("ExecuteBlockV2(%s): %v", BackendName(b), err)
+			}
+			if r.ABIVersion != ABIVersion {
+				t.Errorf("ABIVersion = %d, want %d", r.ABIVersion, ABIVersion)
+			}
+			if len(r.GasUsed) != N {
+				t.Errorf("len(GasUsed) = %d, want %d", len(r.GasUsed), N)
+			}
+			if len(r.Status) != N {
+				t.Errorf("len(Status) = %d, want %d", len(r.Status), N)
+			}
+		})
+	}
+}
