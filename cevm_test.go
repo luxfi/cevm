@@ -191,3 +191,93 @@ func TestExecuteBlockV2Smoke_AllBackends(t *testing.T) {
 		})
 	}
 }
+
+// ComputeBytecode returns deterministic EVM bytecode that does N additions
+// then returns. Used to exercise the GPU opcode interpreter with measurable
+// gas consumption.
+//
+//	loop N times: PUSH1 1, PUSH1 1, ADD, POP
+//	then         PUSH1 0, PUSH1 0, RETURN
+//
+// Each iteration uses 6 gas + the dispatch overhead; 1000 iters ≈ 6000+ gas.
+func computeBytecode(iters int) []byte {
+	out := make([]byte, 0, iters*5+5)
+	for i := 0; i < iters; i++ {
+		out = append(out,
+			0x60, 0x01, // PUSH1 1
+			0x60, 0x01, // PUSH1 1
+			0x01,       // ADD
+			0x50,       // POP
+		)
+	}
+	out = append(out,
+		0x60, 0x00, // PUSH1 0
+		0x60, 0x00, // PUSH1 0
+		0xf3,       // RETURN
+	)
+	return out
+}
+
+func bytecodeTx(i uint64, code []byte) Transaction {
+	var from [20]byte
+	from[19] = byte((i & 0xff))
+	from[18] = byte((i >> 8) & 0xff)
+	return Transaction{
+		From:     from,
+		HasTo:    true,
+		Code:     code,
+		GasLimit: 1_000_000,
+		Nonce:    i,
+		GasPrice: 1,
+	}
+}
+
+// TestGPUBytecodeExecution sends a batch of txs each with real EVM bytecode
+// through the GPU-Metal backend. Verifies the parallel opcode interpreter
+// (kernel::EvmKernelHost) actually executes and reports gas.
+func TestGPUBytecodeExecution(t *testing.T) {
+	if !contains(AvailableBackends(), GPUMetal) {
+		t.Skip("Metal backend not available")
+	}
+	const N = 32
+	code := computeBytecode(50)
+	txs := make([]Transaction, N)
+	for i := range txs {
+		txs[i] = bytecodeTx(uint64(i), code)
+	}
+	r, err := ExecuteBlock(GPUMetal, txs)
+	if err != nil {
+		t.Fatalf("GPU bytecode execute: %v", err)
+	}
+	if len(r.GasUsed) != N {
+		t.Fatalf("len(GasUsed)=%d, want %d", len(r.GasUsed), N)
+	}
+	// Each tx should report > 0 gas (we did real work).
+	zeros := 0
+	for _, g := range r.GasUsed {
+		if g == 0 {
+			zeros++
+		}
+	}
+	if zeros == N {
+		t.Fatalf("all %d txs reported 0 gas — kernel didn't execute bytecode", N)
+	}
+	t.Logf("GPU bytecode: %d txs, total gas=%d, time=%.2fms, per-tx-gas=%v",
+		N, r.TotalGas, r.ExecTimeMs, r.GasUsed[:min(4, N)])
+}
+
+func contains(s []Backend, b Backend) bool {
+	for _, x := range s {
+		if x == b {
+			return true
+		}
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

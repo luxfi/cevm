@@ -46,11 +46,17 @@ func (b Backend) String() string {
 }
 
 // Transaction is a single EVM transaction to execute.
+//
+// When Code is non-empty AND a GPU backend is selected, the C++ EVM
+// dispatches each tx through the parallel opcode interpreter (Metal:
+// kernel::EvmKernelHost, CUDA: cuda::EvmKernel). When Code is empty, GPU
+// backends use the scheduler-only Block-STM kernel.
 type Transaction struct {
 	From     [20]byte
 	To       [20]byte
 	HasTo    bool
-	Data     []byte
+	Data     []byte // Calldata
+	Code     []byte // EVM bytecode (optional — required for real GPU execution)
 	GasLimit uint64
 	Value    uint64
 	Nonce    uint64

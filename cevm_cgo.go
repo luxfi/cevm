@@ -10,7 +10,7 @@ package cevm
 #cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/evm/build/lib
 #cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/evm/build/lib/evm/luxcpp-gpu
 #cgo LDFLAGS: -levm
-#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-gpu -lluxgpu -lstdc++
+#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-kernel-metal -levm-gpu -lluxgpu -lstdc++
 #cgo darwin LDFLAGS: -framework Metal -framework Foundation
 #cgo linux  LDFLAGS: -Wl,--start-group -levm-gpu -lluxgpu -Wl,--end-group -lstdc++
 
@@ -59,6 +59,11 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 			pinner.Pin(&txs[i].Data[0])
 			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&txs[i].Data[0]))
 			ctxs[i].data_len = C.uint32_t(len(tx.Data))
+		}
+		if len(tx.Code) > 0 {
+			pinner.Pin(&txs[i].Code[0])
+			ctxs[i].code = (*C.uint8_t)(unsafe.Pointer(&txs[i].Code[0]))
+			ctxs[i].code_len = C.uint32_t(len(tx.Code))
 		}
 	}
 
@@ -118,6 +123,11 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 			pinner.Pin(&txs[i].Data[0])
 			ctxs[i].data = (*C.uint8_t)(unsafe.Pointer(&txs[i].Data[0]))
 			ctxs[i].data_len = C.uint32_t(len(tx.Data))
+		}
+		if len(tx.Code) > 0 {
+			pinner.Pin(&txs[i].Code[0])
+			ctxs[i].code = (*C.uint8_t)(unsafe.Pointer(&txs[i].Code[0]))
+			ctxs[i].code_len = C.uint32_t(len(tx.Code))
 		}
 	}
 
