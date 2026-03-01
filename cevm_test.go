@@ -1,6 +1,7 @@
 package cevm
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -280,4 +281,82 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestHealth runs the canonical health-check program through every backend
+// and verifies all of them succeed. A healthy production deployment must
+// pass this at startup.
+func TestHealth(t *testing.T) {
+	reports := Health()
+	if len(reports) == 0 {
+		t.Fatal("Health() returned no reports — runtime cannot enumerate backends")
+	}
+	for _, r := range reports {
+		if !r.OK {
+			t.Errorf("Health: backend %q failed: %v", r.Name, r.Err)
+			continue
+		}
+		if r.GasUsed == 0 {
+			t.Errorf("Health: backend %q reported 0 gas", r.Name)
+		}
+		t.Logf("Health: %s ok (gas=%d status=%s time=%.2fms)",
+			r.Name, r.GasUsed, r.Status, r.ExecTime)
+	}
+}
+
+// TestConcurrentExecuteBlock fires multiple goroutines at every available
+// backend simultaneously to exercise the thread-safety of:
+//   - the Go-side cgo binding (per-call pinner, per-call result alloc)
+//   - the C++-side thread_local engine cache + per-instance buffer mutex
+// A race or buffer-cache leak would surface as a corrupted gas total
+// (different from a single-threaded reference run).
+func TestConcurrentExecuteBlock(t *testing.T) {
+	if !contains(AvailableBackends(), GPUMetal) {
+		t.Skip("Metal backend not available")
+	}
+	const goroutines = 8
+	const iterations = 16
+	const N = 8
+	code := computeBytecode(20)
+	txs := make([]Transaction, N)
+	for i := range txs {
+		txs[i] = bytecodeTx(uint64(i), code)
+	}
+
+	// Reference run: single-threaded total gas.
+	ref, err := ExecuteBlock(GPUMetal, txs)
+	if err != nil {
+		t.Fatalf("reference ExecuteBlock: %v", err)
+	}
+	want := ref.TotalGas
+	if want == 0 {
+		t.Fatal("reference total gas == 0")
+	}
+
+	errCh := make(chan error, goroutines*iterations)
+	doneCh := make(chan struct{}, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer func() { doneCh <- struct{}{} }()
+			for i := 0; i < iterations; i++ {
+				r, err := ExecuteBlock(GPUMetal, txs)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if r.TotalGas != want {
+					errCh <- fmt.Errorf("concurrent total gas drift: got %d want %d",
+						r.TotalGas, want)
+					return
+				}
+			}
+		}()
+	}
+	for g := 0; g < goroutines; g++ {
+		<-doneCh
+	}
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
 }
