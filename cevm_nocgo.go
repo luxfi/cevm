@@ -31,3 +31,26 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 	}
 	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
 }
+
+// HealthReport is the per-backend result of Health(). The nocgo build only
+// reports CPUSequential and never executes — it returns OK=false with an
+// explanatory error.
+type HealthReport struct {
+	Backend  Backend
+	Name     string
+	OK       bool
+	Err      error
+	GasUsed  uint64
+	Status   TxStatus
+	ExecTime float64
+}
+
+// Health returns a single non-OK report indicating CGo is disabled.
+func Health() []HealthReport {
+	return []HealthReport{{
+		Backend: CPUSequential,
+		Name:    CPUSequential.String(),
+		OK:      false,
+		Err:     fmt.Errorf("cevm: built without CGo, no backends executable"),
+	}}
+}

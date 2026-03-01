@@ -11,6 +11,26 @@
 // Build with CGo: CGO_ENABLED=1 go build -tags cgo
 // Build without CGo: CGO_ENABLED=0 go build (types only, no execution)
 // Binary: the `cevm` binary in luxcpp/evm/build/bin/ is the Lux VM plugin.
+//
+// # Thread safety
+//
+// ExecuteBlock and ExecuteBlockV2 are safe to call concurrently from
+// multiple goroutines. The underlying C++ engine maintains thread-local
+// kernel hosts per OS thread, so each goroutine that reaches a GPU path
+// gets its own MTLBuffer (Metal) or CUDA-context cache. Within a single
+// instance, the buffer cache is mutex-protected; the Go side never shares
+// mutable state between calls.
+//
+// # ABI version
+//
+// The Go module's ABIVersion constant is checked against the loaded
+// library's gpu_abi_version() in init(). A mismatch panics at process
+// start — that is intentional. A silent ABI mismatch produces wrong
+// gas/state results and would corrupt consensus, so fail-fast is the
+// only safe behaviour.
+//
+// Use Health() at startup to additionally verify each backend executes
+// the canonical health-check bytecode without error.
 package cevm
 
 import "fmt"
@@ -124,4 +144,4 @@ type BlockResultV2 struct {
 
 // ABIVersion is the C ABI version this Go module expects. Compare against
 // the loaded library's gpu_abi_version() to detect version skew.
-const ABIVersion uint32 = 2
+const ABIVersion uint32 = 3
