@@ -7,12 +7,13 @@ package cevm
 #cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib
 #cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib/evm
 #cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib/evm/luxcpp-gpu
+#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib/evmone_precompiles
 #cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/evm/build/lib
 #cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/evm/build/lib/evm/luxcpp-gpu
 #cgo LDFLAGS: -levm
-#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-kernel-metal -levm-gpu -lluxgpu -lstdc++
+#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-kernel-metal -levm-gpu -lluxgpu -levmone_precompiles -lstdc++
 #cgo darwin LDFLAGS: -framework Metal -framework Foundation
-#cgo linux  LDFLAGS: -Wl,--start-group -levm-gpu -lluxgpu -Wl,--end-group -lstdc++
+#cgo linux  LDFLAGS: -Wl,--start-group -levm-gpu -lluxgpu -levmone_precompiles -Wl,--end-group -lstdc++
 
 #include <stdlib.h>
 #include "go_bridge.h"
