@@ -32,17 +32,30 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
 }
 
+// HealthProbeResult mirrors the cgo build's struct so consumers see the same
+// API surface either way. Under nocgo the slice is always empty.
+type HealthProbeResult struct {
+	Name    string
+	OK      bool
+	GasUsed uint64
+	Status  TxStatus
+	Err     error
+}
+
 // HealthReport is the per-backend result of Health(). The nocgo build only
 // reports CPUSequential and never executes — it returns OK=false with an
-// explanatory error.
+// explanatory error and an empty ProbeResults slice.
 type HealthReport struct {
-	Backend  Backend
-	Name     string
-	OK       bool
-	Err      error
-	GasUsed  uint64
-	Status   TxStatus
-	ExecTime float64
+	Backend      Backend
+	Name         string
+	OK           bool
+	Err          error
+	Probe        string
+	ProbesRun    int
+	ProbeResults []HealthProbeResult
+	GasUsed      uint64
+	Status       TxStatus
+	ExecTime     float64
 }
 
 // Health returns a single non-OK report indicating CGo is disabled.

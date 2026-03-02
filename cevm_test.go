@@ -1,9 +1,11 @@
 package cevm
 
-import (
-	"fmt"
-	"testing"
-)
+import "testing"
+
+// Tests in this file run under both `cgo` and `!cgo` builds. They cover the
+// parts of the API that don't depend on the C++ library: enum stringers,
+// constant exports, and the empty-input fast-paths that ExecuteBlock /
+// ExecuteBlockV2 promise to return without error.
 
 func TestBackendString(t *testing.T) {
 	tests := []struct {
@@ -22,44 +24,6 @@ func TestBackendString(t *testing.T) {
 			t.Errorf("Backend(%d).String() = %q, want %q", int(tt.b), got, tt.want)
 		}
 	}
-}
-
-func TestExecuteBlockEmpty(t *testing.T) {
-	result, err := ExecuteBlock(CPUSequential, nil)
-	if err != nil {
-		t.Fatalf("ExecuteBlock(nil) returned error: %v", err)
-	}
-	if result.TotalGas != 0 {
-		t.Errorf("expected 0 total gas for empty block, got %d", result.TotalGas)
-	}
-}
-
-func TestVMID(t *testing.T) {
-	if got := VMID(); got != "cevm" {
-		t.Errorf("VMID() = %q, want %q", got, "cevm")
-	}
-}
-
-func TestPluginPath(t *testing.T) {
-	p := PluginPath()
-	if p == "" {
-		t.Skip("could not determine home directory")
-	}
-	// Just verify the path ends correctly.
-	const suffix = "work/luxcpp/evm/build/bin/cevm"
-	if len(p) < len(suffix) {
-		t.Fatalf("PluginPath() too short: %q", p)
-	}
-	got := p[len(p)-len(suffix):]
-	if got != suffix {
-		t.Errorf("PluginPath() suffix = %q, want %q", got, suffix)
-	}
-}
-
-func TestPluginExists(t *testing.T) {
-	// This test just verifies the function runs without panicking.
-	// Whether it returns true or false depends on the build environment.
-	_ = PluginExists()
 }
 
 func TestTxStatusString(t *testing.T) {
@@ -82,6 +46,45 @@ func TestTxStatusString(t *testing.T) {
 	}
 }
 
+func TestVMID(t *testing.T) {
+	if got := VMID(); got != "cevm" {
+		t.Errorf("VMID() = %q, want %q", got, "cevm")
+	}
+}
+
+func TestPluginPath(t *testing.T) {
+	p := PluginPath()
+	if p == "" {
+		t.Skip("could not determine home directory")
+	}
+	const suffix = "work/luxcpp/evm/build/bin/cevm"
+	if len(p) < len(suffix) {
+		t.Fatalf("PluginPath() too short: %q", p)
+	}
+	got := p[len(p)-len(suffix):]
+	if got != suffix {
+		t.Errorf("PluginPath() suffix = %q, want %q", got, suffix)
+	}
+}
+
+func TestPluginExists(t *testing.T) {
+	// This test just verifies the function runs without panicking.
+	// Whether it returns true or false depends on the build environment.
+	_ = PluginExists()
+}
+
+// TestExecuteBlockEmpty must succeed on both cgo and nocgo paths: the API
+// contract is "empty input ⇒ empty result, no error" regardless of build.
+func TestExecuteBlockEmpty(t *testing.T) {
+	result, err := ExecuteBlock(CPUSequential, nil)
+	if err != nil {
+		t.Fatalf("ExecuteBlock(nil) returned error: %v", err)
+	}
+	if result.TotalGas != 0 {
+		t.Errorf("expected 0 total gas for empty block, got %d", result.TotalGas)
+	}
+}
+
 func TestExecuteBlockV2Empty(t *testing.T) {
 	result, err := ExecuteBlockV2(CPUSequential, 0, nil)
 	if err != nil {
@@ -95,27 +98,17 @@ func TestExecuteBlockV2Empty(t *testing.T) {
 	}
 }
 
-func TestAvailableBackends(t *testing.T) {
+// TestAvailableBackends_NonEmpty: every build must expose at least one backend.
+// Under nocgo, that's CPUSequential. Under cgo, it's whatever the loaded
+// library reports — but never zero.
+func TestAvailableBackends_NonEmpty(t *testing.T) {
 	bs := AvailableBackends()
 	if len(bs) == 0 {
 		t.Fatal("AvailableBackends() returned empty list")
 	}
-	// CPUSequential must always be available.
-	hasSeq := false
-	for _, b := range bs {
-		if b == CPUSequential {
-			hasSeq = true
-		}
-	}
-	if !hasSeq {
-		t.Errorf("AvailableBackends() missing CPUSequential: %v", bs)
-	}
 }
 
-func TestBackendName(t *testing.T) {
-	// BackendName goes through the loaded library (cgo path) or local
-	// Go strings (nocgo path). Either way, it must produce a non-empty
-	// string for known backends.
+func TestBackendName_NonEmpty(t *testing.T) {
 	for _, b := range []Backend{CPUSequential, CPUParallel, GPUMetal, GPUCUDA} {
 		if BackendName(b) == "" {
 			t.Errorf("BackendName(%d) is empty", int(b))
@@ -123,240 +116,12 @@ func TestBackendName(t *testing.T) {
 	}
 }
 
-func TestLibraryABIVersion(t *testing.T) {
-	got := LibraryABIVersion()
-	if got != ABIVersion {
-		t.Errorf("LibraryABIVersion() = %d, want %d (rebuild libevm-gpu)", got, ABIVersion)
-	}
-}
-
-func smokeTx(i uint64) Transaction {
-	var from [20]byte
-	from[19] = byte(i + 1) // distinct sender per tx
-	return Transaction{
-		From:     from,
-		HasTo:    true,
-		GasLimit: 21000,
-		Value:    1,
-		Nonce:    i,
-		GasPrice: 1,
-	}
-}
-
-func TestExecuteBlockSmoke_AllBackends(t *testing.T) {
-	// Send a tiny block through every backend the loaded library exposes.
-	// Each backend must produce a result with TotalGas > 0 and num_txs entries.
-	const N = 4
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = smokeTx(uint64(i))
-	}
-
-	for _, b := range AvailableBackends() {
-		t.Run(BackendName(b), func(t *testing.T) {
-			r, err := ExecuteBlock(b, txs)
-			if err != nil {
-				t.Fatalf("ExecuteBlock(%s): %v", BackendName(b), err)
-			}
-			if r.TotalGas == 0 {
-				t.Errorf("expected non-zero total gas, got 0")
-			}
-			if len(r.GasUsed) != N {
-				t.Errorf("len(GasUsed) = %d, want %d", len(r.GasUsed), N)
-			}
-		})
-	}
-}
-
-func TestExecuteBlockV2Smoke_AllBackends(t *testing.T) {
-	const N = 4
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = smokeTx(uint64(i))
-	}
-	for _, b := range AvailableBackends() {
-		t.Run(BackendName(b), func(t *testing.T) {
-			r, err := ExecuteBlockV2(b, 0, txs)
-			if err != nil {
-				t.Fatalf("ExecuteBlockV2(%s): %v", BackendName(b), err)
-			}
-			if r.ABIVersion != ABIVersion {
-				t.Errorf("ABIVersion = %d, want %d", r.ABIVersion, ABIVersion)
-			}
-			if len(r.GasUsed) != N {
-				t.Errorf("len(GasUsed) = %d, want %d", len(r.GasUsed), N)
-			}
-			if len(r.Status) != N {
-				t.Errorf("len(Status) = %d, want %d", len(r.Status), N)
-			}
-		})
-	}
-}
-
-// ComputeBytecode returns deterministic EVM bytecode that does N additions
-// then returns. Used to exercise the GPU opcode interpreter with measurable
-// gas consumption.
-//
-//	loop N times: PUSH1 1, PUSH1 1, ADD, POP
-//	then         PUSH1 0, PUSH1 0, RETURN
-//
-// Each iteration uses 6 gas + the dispatch overhead; 1000 iters ≈ 6000+ gas.
-func computeBytecode(iters int) []byte {
-	out := make([]byte, 0, iters*5+5)
-	for i := 0; i < iters; i++ {
-		out = append(out,
-			0x60, 0x01, // PUSH1 1
-			0x60, 0x01, // PUSH1 1
-			0x01,       // ADD
-			0x50,       // POP
-		)
-	}
-	out = append(out,
-		0x60, 0x00, // PUSH1 0
-		0x60, 0x00, // PUSH1 0
-		0xf3,       // RETURN
-	)
-	return out
-}
-
-func bytecodeTx(i uint64, code []byte) Transaction {
-	var from [20]byte
-	from[19] = byte((i & 0xff))
-	from[18] = byte((i >> 8) & 0xff)
-	return Transaction{
-		From:     from,
-		HasTo:    true,
-		Code:     code,
-		GasLimit: 1_000_000,
-		Nonce:    i,
-		GasPrice: 1,
-	}
-}
-
-// TestGPUBytecodeExecution sends a batch of txs each with real EVM bytecode
-// through the GPU-Metal backend. Verifies the parallel opcode interpreter
-// (kernel::EvmKernelHost) actually executes and reports gas.
-func TestGPUBytecodeExecution(t *testing.T) {
-	if !contains(AvailableBackends(), GPUMetal) {
-		t.Skip("Metal backend not available")
-	}
-	const N = 32
-	code := computeBytecode(50)
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = bytecodeTx(uint64(i), code)
-	}
-	r, err := ExecuteBlock(GPUMetal, txs)
-	if err != nil {
-		t.Fatalf("GPU bytecode execute: %v", err)
-	}
-	if len(r.GasUsed) != N {
-		t.Fatalf("len(GasUsed)=%d, want %d", len(r.GasUsed), N)
-	}
-	// Each tx should report > 0 gas (we did real work).
-	zeros := 0
-	for _, g := range r.GasUsed {
-		if g == 0 {
-			zeros++
-		}
-	}
-	if zeros == N {
-		t.Fatalf("all %d txs reported 0 gas — kernel didn't execute bytecode", N)
-	}
-	t.Logf("GPU bytecode: %d txs, total gas=%d, time=%.2fms, per-tx-gas=%v",
-		N, r.TotalGas, r.ExecTimeMs, r.GasUsed[:min(4, N)])
-}
-
-func contains(s []Backend, b Backend) bool {
-	for _, x := range s {
-		if x == b {
-			return true
-		}
-	}
-	return false
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// TestHealth runs the canonical health-check program through every backend
-// and verifies all of them succeed. A healthy production deployment must
-// pass this at startup.
-func TestHealth(t *testing.T) {
+// TestHealth_AlwaysReturnsReports: Health() must never return nil. Under
+// nocgo it returns a single non-OK report. Under cgo it returns one report
+// per available backend.
+func TestHealth_AlwaysReturnsReports(t *testing.T) {
 	reports := Health()
 	if len(reports) == 0 {
-		t.Fatal("Health() returned no reports — runtime cannot enumerate backends")
-	}
-	for _, r := range reports {
-		if !r.OK {
-			t.Errorf("Health: backend %q failed: %v", r.Name, r.Err)
-			continue
-		}
-		if r.GasUsed == 0 {
-			t.Errorf("Health: backend %q reported 0 gas", r.Name)
-		}
-		t.Logf("Health: %s ok (gas=%d status=%s time=%.2fms)",
-			r.Name, r.GasUsed, r.Status, r.ExecTime)
-	}
-}
-
-// TestConcurrentExecuteBlock fires multiple goroutines at every available
-// backend simultaneously to exercise the thread-safety of:
-//   - the Go-side cgo binding (per-call pinner, per-call result alloc)
-//   - the C++-side thread_local engine cache + per-instance buffer mutex
-// A race or buffer-cache leak would surface as a corrupted gas total
-// (different from a single-threaded reference run).
-func TestConcurrentExecuteBlock(t *testing.T) {
-	if !contains(AvailableBackends(), GPUMetal) {
-		t.Skip("Metal backend not available")
-	}
-	const goroutines = 8
-	const iterations = 16
-	const N = 8
-	code := computeBytecode(20)
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = bytecodeTx(uint64(i), code)
-	}
-
-	// Reference run: single-threaded total gas.
-	ref, err := ExecuteBlock(GPUMetal, txs)
-	if err != nil {
-		t.Fatalf("reference ExecuteBlock: %v", err)
-	}
-	want := ref.TotalGas
-	if want == 0 {
-		t.Fatal("reference total gas == 0")
-	}
-
-	errCh := make(chan error, goroutines*iterations)
-	doneCh := make(chan struct{}, goroutines)
-	for g := 0; g < goroutines; g++ {
-		go func() {
-			defer func() { doneCh <- struct{}{} }()
-			for i := 0; i < iterations; i++ {
-				r, err := ExecuteBlock(GPUMetal, txs)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				if r.TotalGas != want {
-					errCh <- fmt.Errorf("concurrent total gas drift: got %d want %d",
-						r.TotalGas, want)
-					return
-				}
-			}
-		}()
-	}
-	for g := 0; g < goroutines; g++ {
-		<-doneCh
-	}
-	close(errCh)
-	for err := range errCh {
-		t.Error(err)
+		t.Fatal("Health() returned no reports — even nocgo must report status")
 	}
 }

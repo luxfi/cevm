@@ -12,14 +12,34 @@
 // Build without CGo: CGO_ENABLED=0 go build (types only, no execution)
 // Binary: the `cevm` binary in luxcpp/evm/build/bin/ is the Lux VM plugin.
 //
-// # Thread safety
+// # Concurrency model
 //
 // ExecuteBlock and ExecuteBlockV2 are safe to call concurrently from
-// multiple goroutines. The underlying C++ engine maintains thread-local
-// kernel hosts per OS thread, so each goroutine that reaches a GPU path
-// gets its own MTLBuffer (Metal) or CUDA-context cache. Within a single
-// instance, the buffer cache is mutex-protected; the Go side never shares
-// mutable state between calls.
+// multiple goroutines. The implementation guarantees:
+//
+//  1. No shared mutable state on the Go side. Every call allocates a fresh
+//     []C.CGpuTx for its inputs and a fresh runtime.Pinner for its lifetime.
+//     The pinner pins the base address of every Go-owned []byte (tx.Data,
+//     tx.Code) that the C side dereferences, and is unpinned via defer
+//     after the C call returns — including on the error path.
+//
+//  2. The C result is freed via defer (gpu_free_result / gpu_free_result_v2)
+//     on every code path including failure. Gas/status arrays are copied
+//     into Go-owned slices before the result is freed.
+//
+//  3. The C++ engine uses a thread_local engine cache (one per OS thread
+//     reached by goroutines via cgo) for the Keccak hasher; per-instance
+//     MTLBuffer / CUDA context caches are mutex-protected on the C++ side.
+//     Two goroutines on different OS threads use independent kernel state.
+//
+//  4. The CPU path is fully reentrant: each call constructs a fresh
+//     evmone state and tears it down before returning.
+//
+// What is NOT safe:
+//   - Mutating the Transaction.Data or Transaction.Code slices while a
+//     concurrent ExecuteBlock call is reading them. The pinner only
+//     prevents GC moves; it does not provide read/write synchronization.
+//   - Sharing a *BlockResult between goroutines without external sync.
 //
 // # ABI version
 //
@@ -30,7 +50,8 @@
 // only safe behaviour.
 //
 // Use Health() at startup to additionally verify each backend executes
-// the canonical health-check bytecode without error.
+// the canonical health-check battery (arithmetic, storage, hashing,
+// memory, and the call bridge) without error.
 package cevm
 
 import "fmt"

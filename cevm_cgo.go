@@ -102,6 +102,13 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 // concurrently. The C++ engine uses thread-local kernel hosts, so each
 // goroutine that reaches the GPU path gets its own MTLBuffer/CUDA context
 // cache. There are no shared mutable globals between calls.
+//
+// Memory safety: every Go-owned []byte the C side dereferences (tx.Data,
+// tx.Code) is pinned for the duration of the C call. The ctxs[] slice
+// itself is a stack-allocated local (or heap-promoted by escape analysis,
+// either way reachable) — runtime.KeepAlive(ctxs) at the end guarantees
+// the GC won't collect it while the C call is still in flight. The pinner
+// is unpinned via defer on every return path including errors.
 func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{}, nil
@@ -121,6 +128,12 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 	// when result.gas_used is nil.
 	defer C.gpu_free_result(&result)
 
+	// Defensive: the cgo call above is synchronous so ctxs is reachable
+	// throughout, but make the contract explicit so a future refactor that
+	// moves the C call into a goroutine or callback path doesn't silently
+	// break pointer reachability.
+	runtime.KeepAlive(ctxs)
+
 	if result.ok == 0 {
 		return nil, fmt.Errorf("cevm: execute_block failed")
 	}
@@ -138,6 +151,7 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 // with per-tx status and post-execution state root.
 //
 // Thread safety: same as ExecuteBlock — safe under concurrent goroutines.
+// Memory safety: same pinner + KeepAlive contract as ExecuteBlock.
 func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*BlockResultV2, error) {
 	if len(txs) == 0 {
 		return &BlockResultV2{ABIVersion: ABIVersion}, nil
@@ -154,6 +168,7 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 		C.uint32_t(numThreads),
 	)
 	defer C.gpu_free_result_v2(&result)
+	runtime.KeepAlive(ctxs)
 
 	if result.ok == 0 {
 		return nil, fmt.Errorf("cevm: execute_block_v2 failed")
@@ -221,75 +236,272 @@ func LibraryABIVersion() uint32 {
 	return uint32(C.gpu_abi_version())
 }
 
-// healthBytecode returns the canonical health-check program: PUSH1 1, PUSH1 1,
-// ADD, POP, PUSH1 0, PUSH1 0, RETURN. Every conformant EVM must execute this
-// to completion with a deterministic gas cost.
+// healthProbe is one entry in the Health() battery — a named bytecode
+// program with its expected execution status. Every conformant backend must
+// run each probe to its expected status with non-zero gas.
+type healthProbe struct {
+	name      string
+	bytecode  []byte
+	wantStatus TxStatus
+	// callBridge=true marks probes whose top-level opcode is in the CALL
+	// family (CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2). On the
+	// GPU path these currently route through the dispatcher's "not supported"
+	// shim — we only require that the bridge is exercised (i.e. the probe
+	// runs to completion, not that it succeeds with TxOK). Only enforced on
+	// CPU backends; for GPU we accept any status as long as the kernel
+	// returned cleanly.
+	callBridge bool
+	// strictParity=true means gas must match exactly across all backends
+	// that ran this probe. False for probes whose dynamic gas accounting is
+	// known to differ between the interpretive CPU path (evmone) and the
+	// flat GPU kernel (e.g. KECCAK256 dynamic word cost, MCOPY dynamic
+	// memory expansion). Differences on strict probes are kernel bugs and
+	// must fail Health.
+	strictParity bool
+}
+
+// healthBattery is the ordered list of probes Health() runs against every
+// backend. Each probe targets a different EVM subsystem so a backend that's
+// silently broken in one area (e.g. storage) fails its own probe instead
+// of slipping through.
 //
-// Expected behaviour:
-//   - status == TxOK (0) for STOP — but RETURN-with-zero-bytes ⇒ TxReturn (1).
-//   - gas_used > 0 (we charge GAS_VERYLOW * 6 + GAS_BASE * 2 = 22 minimum
-//     plus the RETURN dispatch).
-func healthBytecode() []byte {
-	return []byte{
-		0x60, 0x01, // PUSH1 1
-		0x60, 0x01, // PUSH1 1
-		0x01,       // ADD
-		0x50,       // POP
-		0x60, 0x00, // PUSH1 0
-		0x60, 0x00, // PUSH1 0
-		0xf3, // RETURN
+// Order matters only insofar as we want simple programs first so a complete
+// breakage shows up on probe[0] before we waste time on later probes.
+func healthBattery() []healthProbe {
+	// arith: PUSH1 1, PUSH1 1, ADD, POP, STOP — pure arithmetic.
+	arith := []byte{0x60, 0x01, 0x60, 0x01, 0x01, 0x50, 0x00}
+
+	// storage: PUSH1 0xAB, PUSH1 0x01, SSTORE, PUSH1 0x01, SLOAD, POP, STOP.
+	storage := []byte{0x60, 0xab, 0x60, 0x01, 0x55, 0x60, 0x01, 0x54, 0x50, 0x00}
+
+	// keccak: hash 32 bytes of zero memory at offset 0.
+	// PUSH1 32, PUSH1 0, KECCAK256, POP, STOP.
+	keccak := []byte{0x60, 0x20, 0x60, 0x00, 0x20, 0x50, 0x00}
+
+	// memory: MSTORE 0xAB at offset 0, MLOAD it back, MCOPY 32 bytes 0->32, STOP.
+	// PUSH1 0xAB, PUSH1 0, MSTORE, PUSH1 0, MLOAD, POP,
+	// PUSH1 32, PUSH1 0, PUSH1 32, MCOPY, STOP.
+	memOps := []byte{
+		0x60, 0xab, 0x60, 0x00, 0x52,
+		0x60, 0x00, 0x51, 0x50,
+		0x60, 0x20, 0x60, 0x00, 0x60, 0x20, 0x5e,
+		0x00,
+	}
+
+	// callBridge: CALL with constant target. On GPU this should hit the
+	// "call not supported" branch in the dispatcher and return cleanly with
+	// TxCallNotSupported. On CPU it executes to TxOK (the in-process EVM
+	// supports CALL).
+	// PUSH1 0 (retSize), PUSH1 0 (retOff), PUSH1 0 (argSize), PUSH1 0 (argOff),
+	// PUSH1 0 (value), ADDRESS (to), PUSH1 0 (gas), CALL, POP, STOP.
+	callBridge := []byte{
+		0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+		0x60, 0x00, 0x30,
+		0x60, 0x00, 0xf1,
+		0x50, 0x00,
+	}
+
+	return []healthProbe{
+		{name: "arith", bytecode: arith, wantStatus: TxOK, strictParity: true},
+		{name: "storage", bytecode: storage, wantStatus: TxOK, strictParity: true},
+		{name: "keccak", bytecode: keccak, wantStatus: TxOK, strictParity: false},
+		{name: "memory", bytecode: memOps, wantStatus: TxOK, strictParity: false},
+		{name: "call-bridge", bytecode: callBridge, wantStatus: TxOK, callBridge: true, strictParity: false},
 	}
 }
 
-// HealthReport is the per-backend result of Health().
+// HealthProbeResult is the outcome of a single probe on a single backend.
+type HealthProbeResult struct {
+	Name    string
+	OK      bool
+	GasUsed uint64
+	Status  TxStatus
+	Err     error
+}
+
+// HealthReport is the per-backend result of Health(). It aggregates the
+// per-probe results into a single OK / not-OK signal: a backend is healthy
+// iff every probe ran to its expected status with non-zero gas.
 type HealthReport struct {
-	Backend  Backend
-	Name     string
-	OK       bool
-	Err      error
+	Backend      Backend
+	Name         string
+	OK           bool
+	Err          error
+	Probe        string // first failing probe name, empty when OK
+	ProbesRun    int
+	ProbeResults []HealthProbeResult
+	// Aggregate stats — sum of gas across probes, time of the last probe.
 	GasUsed  uint64
 	Status   TxStatus
 	ExecTime float64
 }
 
-// Health runs the canonical health-check bytecode through every backend the
-// loaded library exposes and returns a per-backend report. Use at process
-// start to fail-fast on misconfigured GPUs (driver missing, library mismatch,
-// device permissions). Returns nil only if the runtime cannot enumerate
-// backends at all (catastrophic library failure).
+// Health runs a battery of canonical bytecode programs through every backend
+// the loaded library exposes and returns a per-backend report. Use at
+// process start to fail-fast on misconfigured GPUs (driver missing, library
+// mismatch, device permissions, kernel coverage gaps). Returns nil only if
+// the runtime cannot enumerate backends at all.
 //
-// Returns one HealthReport per backend in the order reported by the library.
+// The battery covers:
+//   - arithmetic (ADD/POP) — strict gas parity required across backends
+//   - storage (SSTORE / SLOAD) — strict gas parity required
+//   - hashing (KECCAK256) — non-zero gas required, parity not strict
+//   - memory ops (MSTORE / MLOAD / MCOPY) — non-zero gas required, parity not strict
+//   - the CALL bridge (CALL with a constant target) — must complete cleanly
+//
+// A backend is reported OK iff every probe executed to its expected status
+// with non-zero gas AND its gas matches every other backend on the strict-
+// parity probes. A failure sets Err and Probe to identify the offending
+// case.
 func Health() []HealthReport {
 	backends := AvailableBackends()
 	if len(backends) == 0 {
 		return nil
 	}
+	probes := healthBattery()
 	out := make([]HealthReport, 0, len(backends))
-	code := healthBytecode()
+	for _, b := range backends {
+		rep := HealthReport{
+			Backend:      b,
+			Name:         BackendName(b),
+			ProbeResults: make([]HealthProbeResult, 0, len(probes)),
+		}
+		isGPU := b == GPUMetal || b == GPUCUDA
+		allOK := true
+		for _, p := range probes {
+			pr := runHealthProbe(b, p, isGPU)
+			rep.ProbeResults = append(rep.ProbeResults, pr)
+			rep.ProbesRun++
+			rep.GasUsed += pr.GasUsed
+			rep.Status = pr.Status
+			if !pr.OK && allOK {
+				allOK = false
+				rep.Probe = pr.Name
+				rep.Err = pr.Err
+			}
+		}
+		rep.OK = allOK
+		out = append(out, rep)
+	}
+	// Cross-backend strict-parity check on probes flagged strictParity=true.
+	// Two backends that disagree on gas for "arith" or "storage" indicate a
+	// real consensus bug — mark BOTH as not healthy so the deploy fails fast.
+	enforceStrictParity(out, probes)
+	return out
+}
+
+// enforceStrictParity walks the per-backend reports, finds probes flagged
+// strictParity=true, and marks any backend whose gas differs from the
+// majority value as NotOK. We use the median (robust to one outlier) as
+// the reference rather than the first-seen, so a single buggy CPU build
+// doesn't poison every GPU report.
+func enforceStrictParity(reports []HealthReport, probes []healthProbe) {
+	if len(reports) < 2 {
+		return // nothing to compare
+	}
+	// Build map: probe name → strictParity bit.
+	strict := make(map[string]bool, len(probes))
+	for _, p := range probes {
+		if p.strictParity {
+			strict[p.name] = true
+		}
+	}
+	// For each strict probe, collect the gas values across all backends
+	// that produced an OK probe result, find the majority value, and flag
+	// any backend whose gas differs from it.
+	probeNames := make([]string, 0, len(strict))
+	for n := range strict {
+		probeNames = append(probeNames, n)
+	}
+	for _, probeName := range probeNames {
+		// Per-probe gas histogram across backends.
+		hist := make(map[uint64]int)
+		for _, r := range reports {
+			for _, pr := range r.ProbeResults {
+				if pr.Name == probeName && pr.OK {
+					hist[pr.GasUsed]++
+				}
+			}
+		}
+		if len(hist) <= 1 {
+			continue // all backends agree (or only one backend ran this probe)
+		}
+		// Find majority gas value. Tie → smallest gas (the most evmone-like).
+		var majorityGas uint64
+		var majorityCount int
+		for g, c := range hist {
+			if c > majorityCount || (c == majorityCount && g < majorityGas) {
+				majorityGas = g
+				majorityCount = c
+			}
+		}
+		// Flag backends whose gas differs from majority.
+		for i := range reports {
+			for _, pr := range reports[i].ProbeResults {
+				if pr.Name != probeName || !pr.OK {
+					continue
+				}
+				if pr.GasUsed != majorityGas {
+					reports[i].OK = false
+					if reports[i].Err == nil {
+						reports[i].Err = fmt.Errorf(
+							"strict-parity probe %q: gas=%d but majority=%d (likely kernel gas-accounting bug)",
+							probeName, pr.GasUsed, majorityGas)
+						reports[i].Probe = probeName
+					}
+				}
+			}
+		}
+	}
+}
+
+// runHealthProbe executes one probe on one backend and returns its result.
+// The result.OK rule: gas must be > 0 AND status must match the probe's
+// expectation, modulo the call-bridge exception described in healthProbe.
+func runHealthProbe(b Backend, p healthProbe, isGPU bool) HealthProbeResult {
 	tx := Transaction{
 		HasTo:    true,
-		Code:     code,
-		GasLimit: 100_000,
+		Code:     p.bytecode,
+		GasLimit: 200_000,
 		Nonce:    0,
 		GasPrice: 1,
 	}
-	for _, b := range backends {
-		rep := HealthReport{Backend: b, Name: BackendName(b)}
-		r, err := ExecuteBlockV2(b, 0, []Transaction{tx})
-		if err != nil {
-			rep.Err = err
-		} else if len(r.GasUsed) != 1 || len(r.Status) != 1 {
-			rep.Err = fmt.Errorf("backend %s returned malformed result (gas=%d status=%d)",
-				rep.Name, len(r.GasUsed), len(r.Status))
-		} else if r.GasUsed[0] == 0 {
-			rep.Err = fmt.Errorf("backend %s reported 0 gas — kernel did not execute", rep.Name)
-		} else {
-			rep.OK = true
-			rep.GasUsed = r.GasUsed[0]
-			rep.Status = r.Status[0]
-			rep.ExecTime = r.ExecTimeMs
-		}
-		out = append(out, rep)
+	pr := HealthProbeResult{Name: p.name}
+	r, err := ExecuteBlockV2(b, 0, []Transaction{tx})
+	if err != nil {
+		pr.Err = fmt.Errorf("probe %q: %w", p.name, err)
+		return pr
 	}
-	return out
+	if len(r.GasUsed) != 1 || len(r.Status) != 1 {
+		pr.Err = fmt.Errorf("probe %q: malformed result (gas=%d status=%d)",
+			p.name, len(r.GasUsed), len(r.Status))
+		return pr
+	}
+	pr.GasUsed = r.GasUsed[0]
+	pr.Status = r.Status[0]
+	if pr.GasUsed == 0 {
+		pr.Err = fmt.Errorf("probe %q: 0 gas — kernel did not execute", p.name)
+		return pr
+	}
+	// Call-bridge probe on GPU: any returning status is fine. The point is
+	// that the dispatcher reached the bridge and returned cleanly.
+	if p.callBridge && isGPU {
+		pr.OK = true
+		return pr
+	}
+	if pr.Status != p.wantStatus {
+		// Accept TxReturn for arith probes that end in RETURN; we don't
+		// because arith ends in STOP. But a backend that maps STOP-with-no-
+		// data to TxReturn instead of TxOK is acceptable: both indicate
+		// successful termination. So treat TxOK and TxReturn as equivalent
+		// here.
+		if !(pr.Status == TxReturn && p.wantStatus == TxOK) &&
+			!(pr.Status == TxOK && p.wantStatus == TxReturn) {
+			pr.Err = fmt.Errorf("probe %q: status=%s want=%s",
+				p.name, pr.Status, p.wantStatus)
+			return pr
+		}
+	}
+	pr.OK = true
+	return pr
 }
