@@ -165,4 +165,9 @@ type BlockResultV2 struct {
 
 // ABIVersion is the C ABI version this Go module expects. Compare against
 // the loaded library's gpu_abi_version() to detect version skew.
-const ABIVersion uint32 = 3
+//
+// Bumped to 4 for v0.26.0: the C++ side rotated EVM_GPU_ABI_VERSION when
+// the BlockResultV2.abi_version field landed and the result struct
+// gained a status[] entry per tx. ABI v3 produced silently wrong gas
+// totals when called against a v4 library — we fail-fast in init().
+const ABIVersion uint32 = 4

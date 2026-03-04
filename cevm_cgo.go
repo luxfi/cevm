@@ -162,11 +162,15 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 	defer pinner.Unpin()
 	ctxs := buildTxs(txs, &pinner)
 
+	// Pass EVM_GPU_REV_DEFAULT (Cancun = 12). v0.26 added a revision
+	// parameter so callers can target older hard forks; we always pass
+	// Cancun for production consensus paths.
 	result := C.gpu_execute_block_v2(
 		&ctxs[0],
 		C.uint32_t(len(ctxs)),
 		C.uint8_t(backend),
 		C.uint32_t(numThreads),
+		C.uint8_t(12), // EVM_GPU_REV_CANCUN = EVM_GPU_REV_DEFAULT
 	)
 	defer C.gpu_free_result_v2(&result)
 	runtime.KeepAlive(ctxs)
