@@ -209,6 +209,101 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 	return br, nil
 }
 
+// ExecuteBlockV3 runs a block through the C++ EVM with an explicit block
+// context and returns the V2 result shape (state root + per-tx status).
+//
+// Pass `ctx == nil` for V2 semantics (zero-initialised block context — chain
+// id, timestamp, etc. all resolve to zero). Pass a populated *BlockContext
+// to feed CHAINID, TIMESTAMP, NUMBER, BASEFEE, COINBASE, etc. through to
+// every backend that consumes them (Metal kernel reads it directly; CPU
+// kernel path picks it up once the parallel agent's wiring lands; CUDA
+// host drops it until that backend grows the same overload).
+//
+// Thread safety and memory safety are identical to ExecuteBlockV2: pinner
+// over Data/Code, KeepAlive over the ctxs slice, defer-free of the result.
+// The BlockContext itself is passed by value into a stack-allocated C
+// struct, so it doesn't need pinning.
+func ExecuteBlockV3(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext) (*BlockResultV2, error) {
+	if len(txs) == 0 {
+		return &BlockResultV2{ABIVersion: ABIVersion}, nil
+	}
+
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+	ctxs := buildTxs(txs, &pinner)
+
+	// CBlockContext is layout-compatible with cevm.BlockContext: same
+	// field order, same widths, no padding deltas. Build it on the stack
+	// so we don't need to pin it. When ctx==nil we pass a NULL pointer
+	// and the C side defaults to a zero block context.
+	var cctxStorage C.CBlockContext
+	var cctxPtr *C.CBlockContext
+	if ctx != nil {
+		cctxStorage.origin = *(*[20]C.uint8_t)(unsafe.Pointer(&ctx.Origin[0]))
+		cctxStorage.gas_price = C.uint64_t(ctx.GasPrice)
+		cctxStorage.timestamp = C.uint64_t(ctx.Timestamp)
+		cctxStorage.number = C.uint64_t(ctx.Number)
+		cctxStorage.prevrandao = *(*[32]C.uint8_t)(unsafe.Pointer(&ctx.Prevrandao[0]))
+		cctxStorage.gas_limit = C.uint64_t(ctx.GasLimit)
+		cctxStorage.chain_id = C.uint64_t(ctx.ChainID)
+		cctxStorage.base_fee = C.uint64_t(ctx.BaseFee)
+		cctxStorage.blob_base_fee = C.uint64_t(ctx.BlobBaseFee)
+		cctxStorage.coinbase = *(*[20]C.uint8_t)(unsafe.Pointer(&ctx.Coinbase[0]))
+		cctxStorage.blob_hashes = *(*[8][32]C.uint8_t)(unsafe.Pointer(&ctx.BlobHashes[0][0]))
+		nbh := ctx.NumBlobHashes
+		if nbh > 8 {
+			nbh = 8
+		}
+		cctxStorage.num_blob_hashes = C.uint32_t(nbh)
+		cctxPtr = &cctxStorage
+	}
+
+	result := C.gpu_execute_block_v3(
+		&ctxs[0],
+		C.uint32_t(len(ctxs)),
+		C.uint8_t(backend),
+		C.uint32_t(numThreads),
+		C.uint8_t(12), // EVM_GPU_REV_CANCUN
+		cctxPtr,
+	)
+	defer C.gpu_free_result_v2(&result)
+	runtime.KeepAlive(ctxs)
+	runtime.KeepAlive(cctxStorage)
+
+	if result.ok == 0 {
+		return nil, fmt.Errorf("cevm: execute_block_v3 failed")
+	}
+	if uint32(result.abi_version) != ABIVersion {
+		return nil, fmt.Errorf("cevm: ABI version mismatch in result (lib=%d expected=%d)",
+			uint32(result.abi_version), ABIVersion)
+	}
+
+	br := &BlockResultV2{
+		GasUsed:      copyU64(result.gas_used, uint32(result.num_txs)),
+		TotalGas:     uint64(result.total_gas),
+		ExecTimeMs:   float64(result.exec_time_ms),
+		Conflicts:    uint32(result.conflicts),
+		ReExecutions: uint32(result.re_executions),
+		ABIVersion:   uint32(result.abi_version),
+	}
+	for i := 0; i < 32; i++ {
+		br.StateRoot[i] = byte(result.state_root[i])
+	}
+	if result.status != nil && result.num_txs > 0 {
+		const maxTxsPerBlock = 1 << 24
+		want := uint32(result.num_txs)
+		if want > maxTxsPerBlock {
+			return nil, fmt.Errorf("cevm: result.num_txs=%d exceeds sanity bound", want)
+		}
+		statSlice := unsafe.Slice((*uint8)(unsafe.Pointer(result.status)), int(want))
+		br.Status = make([]TxStatus, want)
+		for i, s := range statSlice {
+			br.Status[i] = TxStatus(s)
+		}
+	}
+	return br, nil
+}
+
 // BackendName returns the human-readable name of a backend as reported by the
 // C++ library (which is authoritative).
 func BackendName(b Backend) string {
