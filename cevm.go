@@ -1,4 +1,4 @@
-// Package cevm provides Go bindings to the C++ EVM (evmone fork with GPU acceleration).
+// Package cevm provides Go bindings to the C++ EVM (cevm) with GPU acceleration.
 // Import this package to use the C++ EVM as a drop-in replacement for go-ethereum's EVM.
 //
 // The C++ EVM supports:
@@ -33,7 +33,7 @@
 //     Two goroutines on different OS threads use independent kernel state.
 //
 //  4. The CPU path is fully reentrant: each call constructs a fresh
-//     evmone state and tears it down before returning.
+//     cevm state and tears it down before returning.
 //
 // What is NOT safe:
 //   - Mutating the Transaction.Data or Transaction.Code slices while a

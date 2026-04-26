@@ -3,17 +3,17 @@
 package cevm
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../luxcpp/evm/lib/evm/gpu
-#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib
-#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib/evm
-#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib/evm/luxcpp-gpu
-#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/evm/build/lib/evmone_precompiles
-#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/evm/build/lib
-#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/evm/build/lib/evm/luxcpp-gpu
+#cgo CFLAGS: -I${SRCDIR}/../../luxcpp/cevm/lib/evm/gpu
+#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/cevm/build/lib
+#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/cevm/build/lib/evm
+#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/cevm/build/lib/evm/luxcpp-gpu
+#cgo LDFLAGS: -L${SRCDIR}/../../luxcpp/cevm/build/lib/cevm_precompiles
+#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/cevm/build/lib
+#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../luxcpp/cevm/build/lib/evm/luxcpp-gpu
 #cgo LDFLAGS: -levm
-#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-kernel-metal -levm-gpu -lluxgpu -levmone_precompiles -lstdc++
+#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-kernel-metal -levm-gpu -lluxgpu -lcevm_precompiles -lstdc++
 #cgo darwin LDFLAGS: -framework Metal -framework Foundation
-#cgo linux  LDFLAGS: -Wl,--start-group -levm-gpu -lluxgpu -levmone_precompiles -Wl,--end-group -lstdc++
+#cgo linux  LDFLAGS: -Wl,--start-group -levm-gpu -lluxgpu -lcevm_precompiles -Wl,--end-group -lstdc++
 
 #include <stdlib.h>
 #include "go_bridge.h"
@@ -353,7 +353,7 @@ type healthProbe struct {
 	callBridge bool
 	// strictParity=true means gas must match exactly across all backends
 	// that ran this probe. False for probes whose dynamic gas accounting is
-	// known to differ between the interpretive CPU path (evmone) and the
+	// known to differ between the interpretive CPU path (cevm) and the
 	// flat GPU kernel (e.g. KECCAK256 dynamic word cost, MCOPY dynamic
 	// memory expansion). Differences on strict probes are kernel bugs and
 	// must fail Health.
@@ -526,7 +526,7 @@ func enforceStrictParity(reports []HealthReport, probes []healthProbe) {
 		if len(hist) <= 1 {
 			continue // all backends agree (or only one backend ran this probe)
 		}
-		// Find majority gas value. Tie → smallest gas (the most evmone-like).
+		// Find majority gas value. Tie → smallest gas (the most CPU-interpretive-like).
 		var majorityGas uint64
 		var majorityCount int
 		for g, c := range hist {
