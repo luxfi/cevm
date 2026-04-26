@@ -163,11 +163,41 @@ type BlockResultV2 struct {
 	ABIVersion   uint32
 }
 
+// BlockContext is the block-level execution context shared by every
+// transaction in a block. It feeds the EVM opcodes that report block-level
+// state: TIMESTAMP, NUMBER, CHAINID, BASEFEE, COINBASE, GASLIMIT,
+// PREVRANDAO, BLOBHASH, BLOBBASEFEE.
+//
+// Pass a non-nil *BlockContext to ExecuteBlockV3 when the call must mirror
+// real chain semantics (consensus, replay, fork-aware execution). The
+// zero-value is the documented "no context" default — chain id resolves
+// to 0, timestamp to 0, etc., which matches the dispatcher's pre-v0.26
+// behaviour.
+//
+// Field layout matches the C-side CBlockContext byte-for-byte: this struct
+// is passed to the C ABI via direct memcpy, no field-by-field translation.
+// Field order MUST match go_bridge.h CBlockContext exactly. Adding new
+// fields requires bumping ABIVersion and the C-side EVM_GPU_ABI_VERSION
+// in lockstep.
+type BlockContext struct {
+	Origin        [20]byte
+	GasPrice      uint64
+	Timestamp     uint64
+	Number        uint64
+	Prevrandao    [32]byte
+	GasLimit      uint64
+	ChainID       uint64
+	BaseFee       uint64
+	BlobBaseFee   uint64
+	Coinbase      [20]byte
+	BlobHashes    [8][32]byte
+	NumBlobHashes uint32
+}
+
 // ABIVersion is the C ABI version this Go module expects. Compare against
 // the loaded library's gpu_abi_version() to detect version skew.
 //
-// Bumped to 4 for v0.26.0: the C++ side rotated EVM_GPU_ABI_VERSION when
-// the BlockResultV2.abi_version field landed and the result struct
-// gained a status[] entry per tx. ABI v3 produced silently wrong gas
-// totals when called against a v4 library — we fail-fast in init().
-const ABIVersion uint32 = 4
+// v5 (v0.26.0): added gpu_execute_block_v3 with CBlockContext (TIMESTAMP,
+// NUMBER, CHAINID, BASEFEE, etc.) and per-tx status[] in BlockResult. V2
+// callers still work; only ExecuteBlockV3 sees the new BlockContext fields.
+const ABIVersion uint32 = 5
